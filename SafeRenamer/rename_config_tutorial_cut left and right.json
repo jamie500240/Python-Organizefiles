@@ -1,0 +1,15 @@
+{
+  "description": "【只切左右底線版】對應 v1 最常用的「切除左右_旁邊文字」功能，其餘規則全部停用",
+  "_guide": "如果之後想加別的規則，去 rename_config_tutorial.json 複製對應的區塊貼進 pipeline 陣列即可，不需要改 .py 程式碼本體。",
+  "pipeline": [
+    {
+      "_comment": "【啟用】切除左邊第1個底線之前的文字、右邊第1個底線之後的文字。例如：v1_專案_草稿.pdf → 專案",
+      "rule": "UnderscoreStripRule",
+      "params": {
+        "left_strip": 1,
+        "right_strip": 1,
+        "sep": "_"
+      }
+    }
+  ]
+}
