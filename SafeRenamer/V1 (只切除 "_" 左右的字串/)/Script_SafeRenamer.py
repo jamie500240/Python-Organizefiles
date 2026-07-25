@@ -1,13 +1,14 @@
 # ==========================================================
-# MODULE:      Script_SafeRenamer
+# MODULE:      Script_SafeRenamer (只處理 "_" 左右兩邊的文字)
 # PURPOSE:     安全批次改名工具：支援乾跑預演、字串切除、防撞名，採「先複製後驗證」非破壞性處理
 # EXPORTS:     RenameFlow, NameProcessor, FileOps, Logger
 # IMPORTS:     os, shutil, tkinter, pathlib, dataclasses, typing
 # FORBIDDEN:   禁止直接對原始檔案執行 move 或 rename；禁止靜默吞沒例外 (except: pass)
 # DEPENDENCIES: 內建標準庫 (無第三方套件依賴)
-# VERSION:     1.0.0 [Stability: Frozen]
+# VERSION:     1.0.1 [Stability: Frozen]
 # ADR-001:     檔案佔用與鎖定簡化處理。遇到佔用或權限錯誤，直接記錄失敗並轉入失敗區，不實作暫存區排隊(Queue)機制。
 # ADR-002:     原子性寫入原則 (All-or-Nothing)。若寫入成功區的檔案未能通過後續的大體驗證，必須在拋出例外前將其清除 (unlink)，防止髒資料污染成功區。
+# ADR-003:     原歷史檔案有導致程式無法運行的空格；此外原 V1、V2、V3 差異較大，故另外列出備存。
 # ==========================================================
 
 import os
