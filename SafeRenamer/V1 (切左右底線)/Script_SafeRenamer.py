@@ -1,5 +1,5 @@
 # ==========================================================
-# MODULE:      Script_SafeRenamer (只處理 "_" 左右兩邊的文字)
+# MODULE:      Script_SafeRenamer (切左右底線)
 # PURPOSE:     安全批次改名工具：支援乾跑預演、字串切除、防撞名，採「先複製後驗證」非破壞性處理
 # EXPORTS:     RenameFlow, NameProcessor, FileOps, Logger
 # IMPORTS:     os, shutil, tkinter, pathlib, dataclasses, typing
