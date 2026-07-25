@@ -1,0 +1,378 @@
+# ==========================================================
+# MODULE:      Script_SafeRenamer （Pipeline版）
+# PURPOSE:     安全批次改名工具：支援正則、EXIF、大小寫、補零與字串切除等多重管線加工
+# EXPORTS:     RenameFlow, NameProcessor, FileOps, Logger
+# IMPORTS:     os, shutil, tkinter, pathlib, dataclasses, typing, re, datetime
+# FORBIDDEN:   禁止直接對原始檔案執行 move 或 rename；禁止靜默吞沒例外 (except: pass)
+# DEPENDENCIES: 內建標準庫為主。EXIF 功能需額外安裝 `pip install pillow` (若無則自動跳過)
+# VERSION:     2.0.1 [Stability: Frozen]
+# NOTE:        本版本為 v2.0.0 之後的品質修正版（除錯層級，無新增合約），
+#              修正項目：sanitize_filename 補上結尾點號/空白防護、
+#              Logger.write 改用顯式 try/except/finally 控管檔案關閉、
+#              execute() 例外處理改用 try/except/else 結構使成功/失敗路徑分離。
+#              修正完畢後依 Frozen 鐵律定案，不再回頭直接修改本檔案。
+# ADR-001:     檔案佔用與鎖定簡化處理 (遇到佔用直接轉入失敗區)。
+# ADR-002:     原子性寫入原則 (All-or-Nothing)，驗證失敗強制清除殘檔。
+# ADR-003:     導入 Pipeline (責任鏈) 模式，將各種改名邏輯解耦為獨立 Rule 積木。
+# ADR-004:     輸出合法性防護。所有經過 Pipeline 加工的檔名，最終必須強制濾除 Windows 非法字元。
+# ADR-004:     考量到 V1、V2、V3 差異巨大，非單純修改BUG，而是有修改過整體架構，故另外擺放。
+# ==========================================================
+
+import os
+import shutil
+import tkinter as tk
+import re
+from tkinter import filedialog
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Tuple, Set, Protocol
+from datetime import datetime
+
+# 嘗試載入 Pillow 處理 EXIF，若使用者未安裝則溫柔降級 (Graceful Degradation)
+try:
+    from PIL import Image, ExifTags
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+# ==========================================
+# 0. 規則積木庫 (Rules Library)
+# ==========================================
+class RenameRule(Protocol):
+    def apply(self, current_name: str, original_path: Path) -> str: ...
+
+class UnderscoreStripRule:
+    def __init__(self, left_strip: int = 0, right_strip: int = 0, sep: str = "_") -> None:
+        self.l_strip: int = left_strip
+        self.r_strip: int = right_strip
+        self.sep: str = sep
+        
+    def apply(self, current_name: str, original_path: Path) -> str:
+        name_part, ext_part = os.path.splitext(current_name)
+        parts: List[str] = name_part.split(self.sep)
+        req: int = self.l_strip + self.r_strip
+        if len(parts) <= req or req == 0:
+            return current_name
+        
+        start_idx: int = self.l_strip
+        end_idx: int = len(parts) - self.r_strip
+        return self.sep.join(parts[start_idx:end_idx]) + ext_part
+
+class RegexRule:
+    def __init__(self, pattern: str, replacement: str) -> None:
+        self.pattern: re.Pattern = re.compile(pattern)
+        self.replacement: str = replacement
+        
+    def apply(self, current_name: str, original_path: Path) -> str:
+        name_part, ext_part = os.path.splitext(current_name)
+        new_name: str = self.pattern.sub(self.replacement, name_part)
+        return f"{new_name}{ext_part}"
+
+class DictReplaceRule:
+    def __init__(self, mapping: dict) -> None:
+        self.mapping: dict = mapping
+        
+    def apply(self, current_name: str, original_path: Path) -> str:
+        name_part, ext_part = os.path.splitext(current_name)
+        for old_str, new_str in self.mapping.items():
+            name_part = name_part.replace(old_str, new_str)
+        return f"{name_part}{ext_part}"
+
+class CasingRule:
+    def __init__(self, mode: str = "lower") -> None:
+        self.mode: str = mode.lower()
+        
+    def apply(self, current_name: str, original_path: Path) -> str:
+        name_part, ext_part = os.path.splitext(current_name)
+        if self.mode == "upper": 
+            name_part = name_part.upper()
+        elif self.mode == "lower": 
+            name_part = name_part.lower()
+        elif self.mode == "title": 
+            name_part = name_part.title()
+        return f"{name_part}{ext_part}"
+
+class ZeroPadRule:
+    def __init__(self, pad_length: int = 3) -> None:
+        self.pad_length: int = pad_length
+        
+    def apply(self, current_name: str, original_path: Path) -> str:
+        name_part, ext_part = os.path.splitext(current_name)
+        new_name: str = re.sub(r'\d+', lambda x: x.group().zfill(self.pad_length), name_part)
+        return f"{new_name}{ext_part}"
+
+class OSModifiedTimeRule:
+    def __init__(self, time_format: str = "%Y%m%d_", prefix: str = "") -> None:
+        self.time_format: str = time_format
+        self.prefix: str = prefix
+        
+    def apply(self, current_name: str, original_path: Path) -> str:
+        mtime: float = original_path.stat().st_mtime
+        time_str: str = datetime.fromtimestamp(mtime).strftime(self.time_format)
+        return f"{self.prefix}{time_str}{current_name}"
+
+class ExifDateRule:
+    def __init__(self, time_format: str = "%Y%m%d_%H%M%S_") -> None:
+        self.time_format: str = time_format
+        
+    def apply(self, current_name: str, original_path: Path) -> str:
+        if not HAS_PIL or original_path.suffix.lower() not in ['.jpg', '.jpeg', '.png']:
+            return current_name
+            
+        try:
+            with Image.open(original_path) as img:
+                exif = img._getexif()
+                if not exif: 
+                    return current_name
+                
+                for k, v in exif.items():
+                    if ExifTags.TAGS.get(k) == "DateTimeOriginal":
+                        dt: datetime = datetime.strptime(v, "%Y:%m:%d %H:%M:%S")
+                        return f"{dt.strftime(self.time_format)}{current_name}"
+        except Exception as e:
+            # 留下警告痕跡，但不中斷 Pipeline
+            print(f"[警告] {original_path.name} 圖片解析或 EXIF 讀取異常: {str(e)}")
+            
+        return current_name
+
+# ==========================================
+# 1. SET (開關與邏輯設定) - SSOT
+# ==========================================
+PIPELINE: List[RenameRule] = [
+    # UnderscoreStripRule(left_strip=1, right_strip=1),
+    # RegexRule(pattern=r'(\d{4})-(\d{2})-(\d{2})', replacement=r'\1\2\3'),
+    # DictReplaceRule(mapping={"Draft": "v1", "Final": "v2", " ": "_"}),
+    # ZeroPadRule(pad_length=3),
+    # CasingRule(mode="lower"),
+    # ExifDateRule(),
+    # OSModifiedTimeRule(time_format="%Y%m%d_")
+]
+
+# ==========================================
+# 2. CONFIG (系統配置) - SSOT
+# ==========================================
+@dataclass
+class AppConfig:
+    SUCCESS_DIR_NAME: str = "檔案"
+    FAIL_DIR_NAME: str = "改名失敗"
+    LOG_FILE_NAME: str = "rename_log.txt"
+    SPEED_MB_PER_SEC: int = 150         
+
+# ==========================================
+# 3. STRING (介面與提示字串) - SSOT
+# ==========================================
+@dataclass
+class AppStrings:
+    SELECT_SOURCE: str = "【步驟 1】請選擇「想處理區」(來源資料夾)"
+    SELECT_TARGET: str = "【步驟 2】請選擇「完成區」(目的資料夾)"
+    ERR_SAME_DIR: str = "[FAIL FAST] 來源與目的資料夾不能相同！"
+    ERR_NO_DIR: str = "[FAIL FAST] 未選擇資料夾，程式終止。"
+    INFO_DRY_RUN: str = "\n=== [DRY RUN] 預覽結果 ==="
+    INFO_EXECUTE: str = "\n=== 開始執行複製與改名 ==="
+    PROMPT_CONTINUE: str = "\n請問是否要執行上述變更？(Y/N): "
+
+CONFIG: AppConfig = AppConfig()
+STR: AppStrings = AppStrings()
+
+# ==========================================
+# ACTION
+# ==========================================
+class NameProcessor:
+    @staticmethod
+    def normalize_filename(filename: str) -> str:
+        return filename.replace("\u3000", " ").strip()
+
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """強制濾除 Windows 檔案系統不允許的非法字元，並剔除前後不合規的空白與點號"""
+        sanitized: str = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        name_part, ext_part = os.path.splitext(sanitized)
+        # 防止檔名主體末端為點號或空白導致系統無法讀寫
+        cleaned_name: str = name_part.strip(" .")
+        return f"{cleaned_name}{ext_part}" if cleaned_name else f"unnamed{ext_part}"
+
+    @staticmethod
+    def generate_new_name(original_path: Path) -> str:
+        current_name: str = NameProcessor.normalize_filename(original_path.name)
+        
+        for rule in PIPELINE:
+            current_name = rule.apply(current_name, original_path)
+            
+        # Pipeline 加工完畢後，進行最終合法性檢查
+        return NameProcessor.sanitize_filename(current_name)
+
+class FileOps:
+    @staticmethod
+    def get_safe_target_path(target_dir: Path, new_name: str, used_names_in_run: Set[str]) -> Path:
+        name_part, ext_part = os.path.splitext(new_name)
+        counter: int = 1
+        final_name: str = new_name
+        
+        while (target_dir / final_name).exists() or (final_name in used_names_in_run):
+            final_name = f"{name_part}_{counter}{ext_part}"
+            counter += 1
+            
+        used_names_in_run.add(final_name)
+        return target_dir / final_name
+
+class Logger:
+    def __init__(self, log_path: Path) -> None:
+        self.log_path: Path = log_path
+        # 初始化清空舊 Log
+        with open(self.log_path, 'w', encoding='utf-8') as f:
+            f.write("=== 批次改名日誌 ===\n")
+            
+    def write(self, msg: str) -> None:
+        f = None
+        try:
+            f = open(self.log_path, 'a', encoding='utf-8')
+            f.write(msg + "\n")
+        except IOError as e:
+            print(f"[LOG ERROR] 日誌寫入失敗: {e}")
+        else:
+            pass
+        finally:
+            if f and not f.closed:
+                f.close()
+
+# ==========================================
+# FLOW
+# ==========================================
+class RenameFlow:
+    def __init__(self) -> None:
+        self.source_dir: Path = Path()
+        self.target_dir: Path = Path()
+        self.success_dir: Path = Path()
+        self.fail_dir: Path = Path()
+        self.file_list: List[Path] = []
+
+    def select_directories(self) -> None:
+        root = tk.Tk()
+        root.withdraw() 
+        
+        try:
+            print(STR.SELECT_SOURCE)
+            src: str = filedialog.askdirectory(title=STR.SELECT_SOURCE)
+            if not src: 
+                raise SystemExit(STR.ERR_NO_DIR)
+            
+            print(STR.SELECT_TARGET)
+            tgt: str = filedialog.askdirectory(title=STR.SELECT_TARGET)
+            if not tgt: 
+                raise SystemExit(STR.ERR_NO_DIR)
+        finally:
+            root.destroy() # 顯式銷毀 Tk 視窗資源
+
+        self.source_dir = Path(src)
+        self.target_dir = Path(tgt)
+
+        if self.source_dir.resolve() == self.target_dir.resolve():
+            raise SystemExit(STR.ERR_SAME_DIR)
+
+        self.success_dir = self.target_dir / CONFIG.SUCCESS_DIR_NAME
+        self.fail_dir = self.target_dir / CONFIG.FAIL_DIR_NAME
+        
+        self.file_list = [f for f in self.source_dir.iterdir() if f.is_file()]
+
+    def dry_run(self) -> List[Tuple[Path, str]]:
+        print(STR.INFO_DRY_RUN)
+        total_size_bytes: int = 0
+        used_names: Set[str] = set()
+        plan: List[Tuple[Path, str]] = [] 
+
+        for file_path in self.file_list:
+            total_size_bytes += file_path.stat().st_size
+            
+            base_new_name: str = NameProcessor.generate_new_name(file_path)
+            safe_path: Path = FileOps.get_safe_target_path(self.success_dir, base_new_name, used_names)
+            
+            plan.append((file_path, safe_path.name))
+            
+            status: str = "[變更]" if file_path.name != safe_path.name else "[原封]"
+            print(f"{status} {file_path.name}  ➔  {safe_path.name}")
+
+        total_mb: float = total_size_bytes / (1024 * 1024)
+        est_seconds: int = max(1, int(total_mb / CONFIG.SPEED_MB_PER_SEC))
+        
+        print(f"\n[統計] 共 {len(self.file_list)} 個檔案，總大小約 {total_mb:.2f} MB。")
+        print(f"[預估] 以 {CONFIG.SPEED_MB_PER_SEC} MB/s 計算，複製大約需要 {est_seconds} 秒。")
+        if not HAS_PIL:
+            print("[提醒] 系統未安裝 Pillow 模組，EXIF 讀取功能將自動跳過 (可使用 pip install pillow 安裝)。")
+        
+        return plan
+
+    def execute(self, plan: List[Tuple[Path, str]]) -> None:
+        print(STR.INFO_EXECUTE)
+        self.success_dir.mkdir(parents=True, exist_ok=True)
+        self.fail_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger: Logger = Logger(self.target_dir / CONFIG.LOG_FILE_NAME)
+        success_count: int = 0
+        fail_count: int = 0
+
+        for original_path, new_name in plan:
+            target_file_path: Path = self.success_dir / new_name
+            try:
+                shutil.copy2(original_path, target_file_path)
+                
+                # 檔案大小驗證
+                if original_path.stat().st_size != target_file_path.stat().st_size:
+                    error_msg: str = f"檔案驗證失敗：來源 ({original_path.stat().st_size} bytes) 與目的大小不符。"
+                    try:
+                        target_file_path.unlink(missing_ok=True)
+                        error_msg += "已成功清除殘檔。"
+                    except OSError as unlink_e:
+                        error_msg += f"【嚴重警告】清除殘檔失敗 ({str(unlink_e)})，成功區可能殘留不完整的髒檔案！"
+                    raise IOError(error_msg)
+
+            except (IOError, OSError, PermissionError) as e:
+                fail_count += 1
+                logger.write(f"[FAIL] {original_path.name} | Error: {str(e)}")
+                try:
+                    shutil.copy2(original_path, self.fail_dir / original_path.name)
+                except (IOError, OSError, PermissionError) as nested_e:
+                    critical_err: str = f"[CRITICAL] 檔案 {original_path.name} 寫入失敗區發生嚴重異常: {str(nested_e)}"
+                    print(critical_err)
+                    logger.write(critical_err)
+            else:
+                success_count += 1
+                logger.write(f"[SUCCESS] {original_path.name} -> {new_name}")
+
+        print(f"\n✅ 執行完畢！成功: {success_count}，失敗: {fail_count}。")
+        print(f"📄 請至 {self.target_dir.resolve()} 查看完成結果與 Log。")
+
+# ==========================================
+# MAIN
+# ==========================================
+def main() -> None:
+    flow: RenameFlow = RenameFlow()
+    try:
+        flow.select_directories()
+        
+        if not flow.file_list:
+            print("[資訊] 來源資料夾中沒有任何檔案。")
+            return
+
+        execution_plan: List[Tuple[Path, str]] = flow.dry_run()
+        
+        if len(PIPELINE) == 0:
+            print("\n[警告] PIPELINE 內無任何啟用的規則，所有檔案都將原封不動複製。")
+
+        user_input: str = input(STR.PROMPT_CONTINUE).strip().upper()
+        if user_input == 'Y':
+            flow.execute(execution_plan)
+        else:
+            print("\n[終止] 使用者取消操作，未進行任何變更。")
+
+    except ValueError as ve: 
+        print(f"\n{ve}")
+    except SystemExit as se: 
+        print(f"\n{se}")
+    except Exception as e: 
+        print(f"\n[未預期錯誤] {str(e)}")
+    finally:
+        # 確保 CMD 視窗在執行結束或報錯時都會停駐
+        input("\n[結束] 請按 Enter 鍵關閉視窗...")
+
+if __name__ == "__main__":
+    main()
